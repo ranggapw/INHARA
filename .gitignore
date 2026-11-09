@@ -4,11 +4,6 @@ __pycache__/
 .venv/
 venv/
 
-# Database lokal
-inhara_camp.db
-*.db
-*.sqlite3
-
 # Streamlit
 .streamlit/secrets.toml
 
