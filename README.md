@@ -1,41 +1,32 @@
-# INHARA CAMP
+SISTEM ADMINISTRASI INHARA CAMP
+Prototype Python + Streamlit + SQLite
 
-Aplikasi administrasi penyewaan perlengkapan camping berbasis Streamlit dan SQLite.
-Fitur yang sudah ada di aplikasi tetap tersedia: ringkasan, data alat, kategori,
-identitas penyewa, penyewaan, transaksi, dan pengembalian.
-Logo INHARA ditampilkan di header dan panel samping aplikasi.
+CARA MENJALANKAN DI VISUAL STUDIO CODE
+1. Ekstrak folder inh ara_camp.zip ke komputer.
+2. Buka folder inh ara_camp melalui VS Code.
+3. Pastikan Python sudah terinstal.
+4. Buka Terminal di VS Code.
+5. (Opsional, disarankan) buat virtual environment:
+   Windows:
+     py -m venv .venv
+     .venv\Scripts\activate
+   Mac/Linux:
+     python3 -m venv .venv
+     source .venv/bin/activate
+6. Instal library:
+     pip install -r requirements.txt
+7. Jalankan aplikasi:
+     streamlit run app.py
+8. Browser akan terbuka otomatis dengan aplikasi INHARA Camp.
 
-## Jalankan di Windows
+Database inh ara.db akan dibuat otomatis ketika aplikasi pertama kali dijalankan.
+Data kategori dan alat contoh juga diisi otomatis.
 
-1. Pasang Python 3.10 atau lebih baru.
-2. Jalankan `run.bat`. Saat pertama kali dijalankan, skrip membuat virtual
-   environment dan memasang dependensi.
-3. Buka alamat yang ditampilkan di terminal (biasanya `http://localhost:8501`).
-
-Database `inhara_camp.db` dibuat otomatis di folder proyek. Di halaman aplikasi,
-gunakan daftar **Pilih halaman** untuk membuka formulir dan mengelola data.
-Aplikasi hanya dibuka dari komputer yang menjalankannya agar data administrasi
-tidak terbuka ke jaringan tanpa perlindungan.
-
-## Jalankan dengan Docker
-
-Pasang Docker Desktop, lalu dari folder proyek jalankan:
-
-```powershell
-docker compose up --build
-```
-
-Buka `http://localhost:8501`. Database disimpan dalam volume Docker `inhara_data`
-agar tetap ada setelah container dimulai ulang. Hentikan dengan `Ctrl+C`; gunakan
-`docker compose down` untuk menurunkan container tanpa menghapus datanya.
-
-## Publikasikan ke internet
-
-Aplikasi dapat dipublikasikan sebagai aplikasi Streamlit dengan memilih `app.py`
-sebagai entry point dan memasang dependensi dari `requirements.txt`. Untuk
-penggunaan operasional, pastikan penyimpanan SQLite persisten dan aksesnya
-dibatasi; penyimpanan lokal layanan hosting gratis dapat bersifat sementara.
-
-Proyek ini menyediakan aplikasi web responsif yang dapat dibuka dari browser
-Android. APK Android native tidak dibuat oleh Streamlit; APK memerlukan aplikasi
-Android pembungkus dan alamat server web yang sudah dipublikasikan.
+CATATAN
+- Stok dan tarif sewa contoh adalah data simulasi, bukan data faktual perusahaan.
+- Fitur yang tersedia: Beranda, Kategori (tambah/ubah/hapus), Data Alat Camping
+  (tambah/ubah/hapus, cari, dan filter kategori).
+- Fitur transaksi penyewaan, data penyewa, pengembalian, login, dan laporan bulanan
+  belum termasuk dalam prototype dasar ini.
+- Untuk mengulang data awal, tutup aplikasi lalu hapus file inh ara.db dan jalankan
+  kembali streamlit run app.py.
