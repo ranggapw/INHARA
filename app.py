@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import csv
+import hashlib
+import hmac
+import html
 import io
 import os
+import re
+import secrets
 import sqlite3
-from base64 import b64encode
+from base64 import b64decode, b64encode
 from collections import Counter
 from contextlib import contextmanager
 from collections.abc import Iterator
@@ -25,6 +30,19 @@ DB_PATH = Path(
 LOGO_PATH = Path(__file__).with_name("Logo Inhara.png")
 FINE_RATE_PERCENT = 20
 
+PBKDF2_ITERATIONS = 600_000
+MIN_PASSWORD_LENGTH = 8
+LOGIN_MAX_ATTEMPTS = 5
+LOGIN_WINDOW_MINUTES = 15
+LOGIN_HISTORY_LIMIT = 200
+USERNAME_PATTERN = re.compile(r"^[a-z0-9._]{3,32}$")
+LOGIN_ACTION_LABELS = {
+    "login": "Masuk",
+    "logout": "Keluar",
+    "login_gagal": "Gagal",
+}
+ROLE_LABELS = {"admin": "Admin", "staf": "Staf"}
+
 
 def logo_data_uri() -> str:
     with Image.open(LOGO_PATH) as image:
@@ -37,6 +55,15 @@ def logo_data_uri() -> str:
         cropped.save(image_buffer, format="PNG")
     encoded = b64encode(image_buffer.getvalue()).decode("ascii")
     return f"data:image/png;base64,{encoded}"
+
+
+def brand_logo_html() -> str:
+    if LOGO_PATH.is_file():
+        return (
+            f'<img class="brand-logo" src="{logo_data_uri()}" '
+            'alt="Logo Inhara Camp">'
+        )
+    return '<div class="brand-name">INHARA CAMP</div>'
 
 
 @contextmanager
@@ -130,6 +157,33 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_rental_unit_details_unit
                 ON rental_unit_details(equipment_unit_id);
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                password_hash TEXT NOT NULL,
+                full_name TEXT NOT NULL DEFAULT '',
+                role TEXT NOT NULL DEFAULT 'staf'
+                    CHECK (role IN ('admin', 'staf')),
+                is_active INTEGER NOT NULL DEFAULT 1
+                    CHECK (is_active IN (0, 1)),
+                created_at TEXT NOT NULL,
+                last_login_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS login_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                username_attempted TEXT NOT NULL,
+                action TEXT NOT NULL
+                    CHECK (action IN ('login', 'logout', 'login_gagal')),
+                reason TEXT NOT NULL DEFAULT '',
+                ip_address TEXT NOT NULL DEFAULT '',
+                user_agent TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_login_history_user
+                ON login_history(user_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_login_history_username
+                ON login_history(username_attempted, created_at DESC);
             """
         )
 
@@ -177,6 +231,230 @@ def init_db() -> None:
                 )
 
         backfill_rental_unit_details(connection)
+
+
+def now_timestamp() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt, PBKDF2_ITERATIONS
+    )
+    return (
+        f"pbkdf2_sha256${PBKDF2_ITERATIONS}$"
+        f"{b64encode(salt).decode('ascii')}${b64encode(digest).decode('ascii')}"
+    )
+
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    try:
+        algorithm, iterations, salt_text, digest_text = stored_hash.split("$")
+        if algorithm != "pbkdf2_sha256":
+            return False
+        rounds = int(iterations)
+        salt = b64decode(salt_text.encode("ascii"))
+        expected = b64decode(digest_text.encode("ascii"))
+    except (ValueError, TypeError):
+        return False
+    candidate = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt, rounds
+    )
+    return hmac.compare_digest(candidate, expected)
+
+
+def db_has_users() -> bool:
+    with connect_db() as connection:
+        return (
+            connection.execute("SELECT 1 FROM users LIMIT 1").fetchone()
+            is not None
+        )
+
+
+def request_client_details() -> tuple[str, str]:
+    try:
+        headers = st.context.headers
+    except Exception:
+        return "-", "-"
+    forwarded = (headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+    address = forwarded or (headers.get("X-Real-Ip") or "").strip() or "-"
+    agent = (headers.get("User-Agent") or "-").strip() or "-"
+    return address[:64], agent[:255]
+
+
+def record_login_event(
+    user_id: int | None,
+    username: str,
+    action: str,
+    reason: str = "",
+) -> None:
+    address, agent = request_client_details()
+    with connect_db() as connection:
+        connection.execute(
+            """
+            INSERT INTO login_history
+                (user_id, username_attempted, action, reason,
+                 ip_address, user_agent, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                username,
+                action,
+                reason,
+                address,
+                agent,
+                now_timestamp(),
+            ),
+        )
+
+
+def failed_attempt_count(username: str) -> int:
+    cutoff = (
+        datetime.now() - timedelta(minutes=LOGIN_WINDOW_MINUTES)
+    ).isoformat(timespec="seconds")
+    with connect_db() as connection:
+        return connection.execute(
+            """
+            SELECT COUNT(*) FROM login_history
+            WHERE username_attempted = ?
+              AND action = 'login_gagal'
+              AND created_at >= ?
+            """,
+            (username, cutoff),
+        ).fetchone()[0]
+
+
+def authenticate_user(
+    username: str, password: str
+) -> tuple[dict[str, object] | None, str]:
+    normalized = username.strip().lower()
+    if failed_attempt_count(normalized) >= LOGIN_MAX_ATTEMPTS:
+        record_login_event(
+            None, normalized, "login_gagal", "Terlalu banyak percobaan"
+        )
+        return (
+            None,
+            "Terlalu banyak percobaan gagal. Coba lagi dalam "
+            f"{LOGIN_WINDOW_MINUTES} menit.",
+        )
+    with connect_db() as connection:
+        user = connection.execute(
+            """
+            SELECT id, username, password_hash, full_name, role, is_active
+            FROM users WHERE username = ?
+            """,
+            (normalized,),
+        ).fetchone()
+    if user is None:
+        record_login_event(
+            None, normalized, "login_gagal", "Username tidak ditemukan"
+        )
+        return None, "Username atau password salah."
+    if not user["is_active"]:
+        record_login_event(
+            user["id"], normalized, "login_gagal", "Akun nonaktif"
+        )
+        return None, "Username atau password salah."
+    if not verify_password(password, user["password_hash"]):
+        record_login_event(
+            user["id"], normalized, "login_gagal", "Password salah"
+        )
+        return None, "Username atau password salah."
+    with connect_db() as connection:
+        connection.execute(
+            "UPDATE users SET last_login_at = ? WHERE id = ?",
+            (now_timestamp(), user["id"]),
+        )
+    record_login_event(user["id"], user["username"], "login")
+    return {
+        "id": user["id"],
+        "username": user["username"],
+        "full_name": user["full_name"],
+        "role": user["role"],
+    }, ""
+
+
+def create_user(
+    username: str,
+    password: str,
+    full_name: str = "",
+    role: str = "staf",
+) -> dict[str, object]:
+    normalized = username.strip().lower()
+    if not USERNAME_PATTERN.fullmatch(normalized):
+        raise ValueError(
+            "Username 3-32 karakter dan hanya boleh berisi huruf, angka, "
+            "titik, atau garis bawah."
+        )
+    if len(password) < MIN_PASSWORD_LENGTH:
+        raise ValueError(
+            f"Password minimal {MIN_PASSWORD_LENGTH} karakter."
+        )
+    if role not in ROLE_LABELS:
+        raise ValueError("Role pengguna tidak valid.")
+    display_name = full_name.strip() or normalized
+    with connect_db() as connection:
+        try:
+            cursor = connection.execute(
+                """
+                INSERT INTO users
+                    (username, password_hash, full_name, role, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    normalized,
+                    hash_password(password),
+                    display_name,
+                    role,
+                    now_timestamp(),
+                ),
+            )
+        except sqlite3.IntegrityError:
+            raise ValueError("Username sudah dipakai.") from None
+    return {
+        "id": cursor.lastrowid,
+        "username": normalized,
+        "full_name": display_name,
+        "role": role,
+    }
+
+
+def current_user() -> dict[str, object] | None:
+    return st.session_state.get("auth_user")
+
+
+def start_session(user: dict[str, object]) -> None:
+    st.session_state["auth_user"] = user
+    st.session_state["main_menu"] = "Ringkasan"
+
+
+def end_session() -> None:
+    user = current_user()
+    if user is not None:
+        record_login_event(int(user["id"]), str(user["username"]), "logout")
+    st.session_state.pop("auth_user", None)
+    st.session_state.pop("main_menu", None)
+    st.rerun()
+
+
+def load_login_history(user: dict[str, object]) -> list[sqlite3.Row]:
+    with connect_db() as connection:
+        if user["role"] == "admin":
+            return connection.execute(
+                "SELECT * FROM login_history ORDER BY id DESC LIMIT ?",
+                (LOGIN_HISTORY_LIMIT,),
+            ).fetchall()
+        return connection.execute(
+            """
+            SELECT * FROM login_history
+            WHERE user_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (user["id"], LOGIN_HISTORY_LIMIT),
+        ).fetchall()
 
 
 def rental_days(start: date, due: date) -> int:
@@ -724,6 +1002,60 @@ def add_page_style() -> None:
             font-size: .69rem;
             font-weight: 700;
             letter-spacing: .11em;
+        }
+        .auth-hero {
+            margin: 1.4rem 0 1.2rem;
+            text-align: center;
+        }
+        .auth-logo {
+            display: grid;
+            place-items: center;
+            max-width: 220px;
+            margin: 0 auto .95rem;
+            padding: .9rem 1.05rem;
+            border-radius: 20px;
+            background: #fff;
+            box-shadow: 0 12px 32px rgba(27, 118, 94, .13);
+        }
+        .auth-kicker {
+            color: #718078;
+            font-size: .68rem;
+            font-weight: 750;
+            letter-spacing: .16em;
+        }
+        .auth-title {
+            margin: .4rem 0 .25rem;
+            color: #1c624f;
+            font-size: 1.7rem;
+            font-weight: 800;
+            letter-spacing: .03em;
+        }
+        .auth-subtitle {
+            max-width: 32rem;
+            margin: 0 auto;
+            color: var(--muted);
+            font-size: .88rem;
+        }
+        .sidebar-user {
+            margin-top: .95rem;
+            padding: .8rem .85rem;
+            border: 1px solid rgba(255, 255, 255, .16);
+            border-radius: 13px;
+            background: rgba(255, 255, 255, .08);
+        }
+        .sidebar-user-name {
+            color: #f3f5ef;
+            font-size: .92rem;
+            font-weight: 700;
+            line-height: 1.2;
+        }
+        .sidebar-user-role {
+            margin-top: .2rem;
+            color: rgba(243, 245, 239, .7);
+            font-size: .66rem;
+            font-weight: 700;
+            letter-spacing: .11em;
+            text-transform: uppercase;
         }
         .dashboard-heading {
             display: flex;
@@ -2030,6 +2362,165 @@ def render_returns() -> None:
             st.error(str(error))
 
 
+def format_timestamp(value: str) -> str:
+    try:
+        return datetime.fromisoformat(value).strftime("%d-%m-%Y %H:%M:%S")
+    except ValueError:
+        return value
+
+
+def render_auth_screen() -> None:
+    first_user = not db_has_users()
+    _, center, _ = st.columns([1, 1.5, 1])
+    with center:
+        st.markdown(
+            f"""
+            <div class="auth-hero">
+                <div class="auth-logo">{brand_logo_html()}</div>
+                <div class="auth-kicker">ADMINISTRASI PENYEWAAN</div>
+                <h1 class="auth-title">INHARA CAMP</h1>
+                <p class="auth-subtitle">
+                    Masuk untuk mengelola data alat, penyewa, dan transaksi.
+                </p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if first_user:
+            st.info(
+                "Belum ada akun. Akun pertama yang didaftarkan otomatis "
+                "menjadi admin."
+            )
+        signin_tab, signup_tab = st.tabs(["Masuk", "Daftar"])
+        with signin_tab:
+            with st.form("signin_form"):
+                username = st.text_input("Username", key="signin_username")
+                password = st.text_input(
+                    "Password", type="password", key="signin_password"
+                )
+                submitted = st.form_submit_button(
+                    "Masuk", type="primary", width="stretch"
+                )
+            if submitted:
+                user, error = authenticate_user(username, password)
+                if user is None:
+                    st.error(error)
+                else:
+                    start_session(user)
+                    st.rerun()
+        with signup_tab:
+            with st.form("signup_form"):
+                full_name = st.text_input(
+                    "Nama lengkap", key="signup_full_name"
+                )
+                username = st.text_input(
+                    "Username",
+                    key="signup_username",
+                    help="3-32 karakter: huruf, angka, titik, atau garis bawah.",
+                )
+                password = st.text_input(
+                    "Password",
+                    type="password",
+                    key="signup_password",
+                    help=f"Minimal {MIN_PASSWORD_LENGTH} karakter.",
+                )
+                confirm = st.text_input(
+                    "Ulangi password",
+                    type="password",
+                    key="signup_confirm",
+                )
+                submitted = st.form_submit_button(
+                    "Daftar", type="primary", width="stretch"
+                )
+            if submitted:
+                if password != confirm:
+                    st.error("Konfirmasi password tidak sama.")
+                else:
+                    try:
+                        create_user(
+                            username,
+                            password,
+                            full_name,
+                            role="admin" if first_user else "staf",
+                        )
+                    except ValueError as error:
+                        st.error(str(error))
+                    else:
+                        user, error = authenticate_user(username, password)
+                        if user is None:
+                            st.error(error)
+                        else:
+                            start_session(user)
+                            st.rerun()
+
+
+def render_login_history() -> None:
+    user = current_user()
+    if user is None:
+        return
+    is_admin = user["role"] == "admin"
+    render_page_heading(
+        "Riwayat login",
+        (
+            "Catatan aktivitas masuk dan keluar seluruh akun."
+            if is_admin
+            else "Riwayat aktivitas masuk dan keluar akun Anda."
+        ),
+    )
+    rows = load_login_history(user)
+    success = sum(1 for row in rows if row["action"] == "login")
+    failed = sum(1 for row in rows if row["action"] == "login_gagal")
+    last_login = next(
+        (row for row in rows if row["action"] == "login"), None
+    )
+    metric_cols = st.columns(3)
+    metric_cols[0].metric("Total aktivitas", len(rows))
+    metric_cols[1].metric("Login berhasil", success)
+    metric_cols[2].metric("Login gagal", failed)
+    if last_login is not None:
+        st.caption(
+            f"Login terakhir: {format_timestamp(last_login['created_at'])}"
+        )
+    st.divider()
+    filter_choice = "Semua"
+    if is_admin and rows:
+        usernames = sorted({row["username_attempted"] for row in rows})
+        filter_choice = st.selectbox(
+            "Filter username",
+            ["Semua", *usernames],
+            key="login_history_filter",
+        )
+    display_rows = [
+        row
+        for row in rows
+        if filter_choice == "Semua"
+        or row["username_attempted"] == filter_choice
+    ]
+    if not display_rows:
+        st.info("Belum ada catatan login.")
+        return
+    st.dataframe(
+        [
+            {
+                "Waktu": format_timestamp(row["created_at"]),
+                "Username": row["username_attempted"],
+                "Aktivitas": LOGIN_ACTION_LABELS.get(
+                    row["action"], row["action"]
+                ),
+                "Keterangan": row["reason"] or "-",
+                "IP": row["ip_address"] or "-",
+                "Perangkat": row["user_agent"] or "-",
+            }
+            for row in display_rows
+        ],
+        width="stretch",
+        hide_index=True,
+    )
+    st.caption(
+        f"Menampilkan maksimal {LOGIN_HISTORY_LIMIT} catatan terakhir."
+    )
+
+
 def main() -> None:
     st.set_page_config(
         page_title="INHARA CAMP | Administrasi",
@@ -2038,11 +2529,11 @@ def main() -> None:
     )
     add_page_style()
     init_db()
-    logo = (
-        f'<img class="brand-logo" src="{logo_data_uri()}" alt="Logo Inhara Camp">'
-        if LOGO_PATH.is_file()
-        else '<div class="brand-name">INHARA CAMP</div>'
-    )
+    user = current_user()
+    if user is None:
+        render_auth_screen()
+        return
+    logo = brand_logo_html()
     pages = [
         "Ringkasan",
         "Data alat",
@@ -2051,6 +2542,7 @@ def main() -> None:
         "Penyewaan baru",
         "Transaksi",
         "Pengembalian",
+        "Riwayat login",
     ]
     with st.sidebar:
         st.markdown(
@@ -2075,6 +2567,19 @@ def main() -> None:
             ):
                 st.session_state["main_menu"] = menu_page
         st.caption("Data tersimpan di SQLite lokal")
+        display_name = html.escape(str(user["full_name"] or user["username"]))
+        role_label = ROLE_LABELS.get(str(user["role"]), str(user["role"]))
+        st.markdown(
+            f"""
+            <div class="sidebar-user">
+                <div class="sidebar-user-name">{display_name}</div>
+                <div class="sidebar-user-role">{role_label}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if st.button("Keluar", key="logout_button", width="stretch"):
+            end_session()
 
     with st.container(key="app_surface"):
         page = st.session_state.get("main_menu", "Ringkasan")
@@ -2090,8 +2595,10 @@ def main() -> None:
             render_new_rental()
         elif page == "Transaksi":
             render_transactions()
-        else:
+        elif page == "Pengembalian":
             render_returns()
+        else:
+            render_login_history()
 
 
 if __name__ == "__main__":
