@@ -41,7 +41,39 @@ LOGIN_ACTION_LABELS = {
     "logout": "Keluar",
     "login_gagal": "Gagal",
 }
-ROLE_LABELS = {"admin": "Admin", "staf": "Staf"}
+ROLE_LABELS = {"owner": "Owner", "admin": "Admin", "kasir": "Kasir"}
+ROLE_PAGES = {
+    "owner": (
+        "Ringkasan",
+        "Data alat",
+        "Kategori alat",
+        "Identitas penyewa",
+        "Penyewaan baru",
+        "Transaksi",
+        "Pengembalian",
+        "Riwayat login",
+        "Manajemen pengguna",
+    ),
+    "admin": (
+        "Ringkasan",
+        "Data alat",
+        "Kategori alat",
+        "Identitas penyewa",
+        "Penyewaan baru",
+        "Transaksi",
+        "Pengembalian",
+        "Riwayat login",
+    ),
+    "kasir": (
+        "Ringkasan",
+        "Identitas penyewa",
+        "Penyewaan baru",
+        "Transaksi",
+        "Pengembalian",
+        "Riwayat login",
+    ),
+}
+
 
 
 def logo_data_uri() -> str:
@@ -162,8 +194,8 @@ def init_db() -> None:
                 username TEXT NOT NULL UNIQUE COLLATE NOCASE,
                 password_hash TEXT NOT NULL,
                 full_name TEXT NOT NULL DEFAULT '',
-                role TEXT NOT NULL DEFAULT 'staf'
-                    CHECK (role IN ('admin', 'staf')),
+                role TEXT NOT NULL DEFAULT 'kasir'
+                    CHECK (role IN ('owner', 'admin', 'kasir')),
                 is_active INTEGER NOT NULL DEFAULT 1
                     CHECK (is_active IN (0, 1)),
                 created_at TEXT NOT NULL,
@@ -231,6 +263,53 @@ def init_db() -> None:
                 )
 
         backfill_rental_unit_details(connection)
+
+        users_schema = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'users'"
+        ).fetchone()
+        if users_schema and "'staf'" in users_schema["sql"]:
+            connection.commit()
+            connection.execute("PRAGMA foreign_keys = OFF")
+            connection.executescript(
+                """
+                CREATE TABLE users_migrated (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    password_hash TEXT NOT NULL,
+                    full_name TEXT NOT NULL DEFAULT '',
+                    role TEXT NOT NULL DEFAULT 'kasir'
+                        CHECK (role IN ('owner', 'admin', 'kasir')),
+                    is_active INTEGER NOT NULL DEFAULT 1
+                        CHECK (is_active IN (0, 1)),
+                    created_at TEXT NOT NULL,
+                    last_login_at TEXT
+                );
+                INSERT INTO users_migrated
+                    (id, username, password_hash, full_name, role,
+                     is_active, created_at, last_login_at)
+                SELECT id, username, password_hash, full_name,
+                       CASE role WHEN 'staf' THEN 'kasir' ELSE role END,
+                       is_active, created_at, last_login_at
+                FROM users;
+                DROP TABLE users;
+                ALTER TABLE users_migrated RENAME TO users;
+                """
+            )
+            connection.commit()
+            connection.execute("PRAGMA foreign_keys = ON")
+
+        has_owner = connection.execute(
+            "SELECT 1 FROM users WHERE role = 'owner' LIMIT 1"
+        ).fetchone()
+        if has_owner is None:
+            first_user = connection.execute(
+                "SELECT id FROM users ORDER BY id LIMIT 1"
+            ).fetchone()
+            if first_user is not None:
+                connection.execute(
+                    "UPDATE users SET role = 'owner' WHERE id = ?",
+                    (first_user["id"],),
+                )
 
 
 def now_timestamp() -> str:
@@ -380,7 +459,7 @@ def create_user(
     username: str,
     password: str,
     full_name: str = "",
-    role: str = "staf",
+    role: str = "kasir",
 ) -> dict[str, object]:
     normalized = username.strip().lower()
     if not USERNAME_PATTERN.fullmatch(normalized):
@@ -441,7 +520,7 @@ def end_session() -> None:
 
 def load_login_history(user: dict[str, object]) -> list[sqlite3.Row]:
     with connect_db() as connection:
-        if user["role"] == "admin":
+        if user["role"] == "owner":
             return connection.execute(
                 "SELECT * FROM login_history ORDER BY id DESC LIMIT ?",
                 (LOGIN_HISTORY_LIMIT,),
@@ -455,6 +534,75 @@ def load_login_history(user: dict[str, object]) -> list[sqlite3.Row]:
             """,
             (user["id"], LOGIN_HISTORY_LIMIT),
         ).fetchall()
+
+
+def load_users() -> list[sqlite3.Row]:
+    with connect_db() as connection:
+        return connection.execute(
+            """
+            SELECT id, username, full_name, role, is_active,
+                   created_at, last_login_at
+            FROM users
+            ORDER BY id
+            """
+        ).fetchall()
+
+
+def update_user_role(user_id: int, role: str) -> None:
+    if role not in ROLE_LABELS:
+        raise ValueError("Role pengguna tidak valid.")
+    with connect_db() as connection:
+        owners = connection.execute(
+            "SELECT COUNT(*) FROM users WHERE role = 'owner'"
+        ).fetchone()[0]
+        current = connection.execute(
+            "SELECT role FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        if (
+            current is not None
+            and current["role"] == "owner"
+            and role != "owner"
+            and owners <= 1
+        ):
+            raise ValueError("Minimal harus ada satu akun owner.")
+        connection.execute(
+            "UPDATE users SET role = ? WHERE id = ?", (role, user_id)
+        )
+
+
+def set_user_active(user_id: int, is_active: bool) -> None:
+    with connect_db() as connection:
+        if not is_active:
+            owners = connection.execute(
+                "SELECT COUNT(*) FROM users WHERE role = 'owner' AND is_active = 1"
+            ).fetchone()[0]
+            current = connection.execute(
+                "SELECT role, is_active FROM users WHERE id = ?", (user_id,)
+            ).fetchone()
+            if (
+                current is not None
+                and current["role"] == "owner"
+                and current["is_active"]
+                and owners <= 1
+            ):
+                raise ValueError("Akun owner aktif terakhir tidak bisa dinonaktifkan.")
+        connection.execute(
+            "UPDATE users SET is_active = ? WHERE id = ?",
+            (1 if is_active else 0, user_id),
+        )
+
+
+def reset_user_password(user_id: int, new_password: str) -> None:
+    if len(new_password) < MIN_PASSWORD_LENGTH:
+        raise ValueError(
+            f"Password minimal {MIN_PASSWORD_LENGTH} karakter."
+        )
+    with connect_db() as connection:
+        connection.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ?",
+            (hash_password(new_password), user_id),
+        )
+
 
 
 def rental_days(start: date, due: date) -> int:
@@ -2389,7 +2537,7 @@ def render_auth_screen() -> None:
         if first_user:
             st.info(
                 "Belum ada akun. Akun pertama yang didaftarkan otomatis "
-                "menjadi admin."
+                "menjadi owner. Pendaftaran berikutnya membuat akun kasir."
             )
         signin_tab, signup_tab = st.tabs(["Masuk", "Daftar"])
         with signin_tab:
@@ -2416,7 +2564,10 @@ def render_auth_screen() -> None:
                 username = st.text_input(
                     "Username",
                     key="signup_username",
-                    help="3-32 karakter: huruf, angka, titik, atau garis bawah.",
+                    help=(
+                        "3-32 karakter: huruf, angka, titik, atau garis bawah. "
+                        "Akun baru terdaftar sebagai kasir."
+                    ),
                 )
                 password = st.text_input(
                     "Password",
@@ -2441,7 +2592,7 @@ def render_auth_screen() -> None:
                             username,
                             password,
                             full_name,
-                            role="admin" if first_user else "staf",
+                            role="owner" if first_user else "kasir",
                         )
                     except ValueError as error:
                         st.error(str(error))
@@ -2458,12 +2609,12 @@ def render_login_history() -> None:
     user = current_user()
     if user is None:
         return
-    is_admin = user["role"] == "admin"
+    is_owner = user["role"] == "owner"
     render_page_heading(
         "Riwayat login",
         (
             "Catatan aktivitas masuk dan keluar seluruh akun."
-            if is_admin
+            if is_owner
             else "Riwayat aktivitas masuk dan keluar akun Anda."
         ),
     )
@@ -2483,7 +2634,7 @@ def render_login_history() -> None:
         )
     st.divider()
     filter_choice = "Semua"
-    if is_admin and rows:
+    if is_owner and rows:
         usernames = sorted({row["username_attempted"] for row in rows})
         filter_choice = st.selectbox(
             "Filter username",
@@ -2521,6 +2672,135 @@ def render_login_history() -> None:
     )
 
 
+def render_user_management() -> None:
+    user = current_user()
+    if user is None or user["role"] != "owner":
+        st.error("Halaman ini hanya dapat diakses oleh owner.")
+        return
+    render_page_heading(
+        "Manajemen pengguna",
+        "Kelola peran, status, dan password akun.",
+    )
+    flash = st.session_state.pop("user_management_flash", "")
+    if flash:
+        st.success(flash)
+    rows = load_users()
+    role_counts = Counter(str(row["role"]) for row in rows)
+    metrics = st.columns(4)
+    metrics[0].metric("Total akun", len(rows))
+    metrics[1].metric(
+        "Akun aktif", sum(1 for row in rows if row["is_active"])
+    )
+    metrics[2].metric("Owner", role_counts.get("owner", 0))
+    metrics[3].metric(
+        "Admin / Kasir",
+        f'{role_counts.get("admin", 0)} / {role_counts.get("kasir", 0)}',
+    )
+    st.dataframe(
+        [
+            {
+                "Username": row["username"],
+                "Nama": row["full_name"] or "-",
+                "Peran": ROLE_LABELS.get(row["role"], row["role"]),
+                "Status": "Aktif" if row["is_active"] else "Nonaktif",
+                "Dibuat": format_timestamp(row["created_at"]),
+                "Login terakhir": (
+                    format_timestamp(row["last_login_at"])
+                    if row["last_login_at"]
+                    else "-"
+                ),
+            }
+            for row in rows
+        ],
+        hide_index=True,
+        width="stretch",
+    )
+    editable = [row for row in rows if row["id"] != user["id"]]
+    if not editable:
+        st.info("Belum ada akun lain yang dapat dikelola.")
+        return
+    labels = {
+        row["id"]: (
+            f'{row["username"]} · {ROLE_LABELS.get(row["role"], row["role"])}'
+        )
+        for row in editable
+    }
+    st.divider()
+    st.subheader("Ubah akun")
+    with st.form("manage_user_form"):
+        selected_id = st.selectbox(
+            "Akun",
+            options=[row["id"] for row in editable],
+            format_func=lambda value: labels[value],
+            key="manage_user_target",
+        )
+        selected = next(
+            row for row in editable if row["id"] == selected_id
+        )
+        new_role = st.selectbox(
+            "Peran",
+            options=list(ROLE_LABELS),
+            index=list(ROLE_LABELS).index(str(selected["role"])),
+            format_func=lambda value: ROLE_LABELS[value],
+            key=f"manage_user_role_{selected_id}",
+        )
+        active = st.checkbox(
+            "Akun aktif",
+            value=bool(selected["is_active"]),
+            key=f"manage_user_active_{selected_id}",
+        )
+        submitted = st.form_submit_button(
+            "Simpan perubahan", type="primary"
+        )
+    if submitted:
+        try:
+            if new_role != selected["role"]:
+                update_user_role(selected_id, new_role)
+            if active != bool(selected["is_active"]):
+                set_user_active(selected_id, active)
+        except ValueError as error:
+            st.error(str(error))
+        else:
+            st.session_state["user_management_flash"] = (
+                f"Akun {selected['username']} diperbarui."
+            )
+            st.rerun()
+
+    st.subheader("Reset password")
+    with st.form("reset_password_form", clear_on_submit=True):
+        reset_id = st.selectbox(
+            "Akun",
+            options=[row["id"] for row in editable],
+            format_func=lambda value: labels[value],
+            key="reset_password_target",
+        )
+        new_password = st.text_input(
+            "Password baru", type="password", key="reset_password_value"
+        )
+        confirm_password = st.text_input(
+            "Ulangi password baru",
+            type="password",
+            key="reset_password_confirm",
+        )
+        submitted_reset = st.form_submit_button(
+            "Reset password", type="primary"
+        )
+    if submitted_reset:
+        target = next(row for row in editable if row["id"] == reset_id)
+        if new_password != confirm_password:
+            st.error("Konfirmasi password tidak sama.")
+        else:
+            try:
+                reset_user_password(reset_id, new_password)
+            except ValueError as error:
+                st.error(str(error))
+            else:
+                st.session_state["user_management_flash"] = (
+                    f"Password {target['username']} berhasil direset."
+                )
+                st.rerun()
+
+
 def main() -> None:
     st.set_page_config(
         page_title="INHARA CAMP | Administrasi",
@@ -2534,16 +2814,8 @@ def main() -> None:
         render_auth_screen()
         return
     logo = brand_logo_html()
-    pages = [
-        "Ringkasan",
-        "Data alat",
-        "Kategori alat",
-        "Identitas penyewa",
-        "Penyewaan baru",
-        "Transaksi",
-        "Pengembalian",
-        "Riwayat login",
-    ]
+    role = str(user["role"])
+    pages = list(ROLE_PAGES.get(role, ROLE_PAGES["kasir"]))
     with st.sidebar:
         st.markdown(
             f"""
@@ -2583,6 +2855,9 @@ def main() -> None:
 
     with st.container(key="app_surface"):
         page = st.session_state.get("main_menu", "Ringkasan")
+        if page not in pages:
+            page = "Ringkasan"
+            st.session_state["main_menu"] = page
         if page == "Ringkasan":
             render_dashboard()
         elif page == "Data alat":
@@ -2597,8 +2872,10 @@ def main() -> None:
             render_transactions()
         elif page == "Pengembalian":
             render_returns()
-        else:
+        elif page == "Riwayat login":
             render_login_history()
+        else:
+            render_user_management()
 
 
 if __name__ == "__main__":
